@@ -48,6 +48,7 @@
     let isMuted = false;
     let previousVolume = 80;
     let streamMode = localStorage.getItem('streamMode') || 'proxy'; // 'proxy' or 'direct'
+    let usingDirect = false; // true when the current src is the raw googlevideo URL
     let lastStreamData = null; // cache last /api/stream response for mode switching
 
     // Initialize toggle UI from saved preference
@@ -211,9 +212,12 @@
             playerArtist.textContent = data.author;
             playerBadge.textContent = data.itag === 140 ? 'AAC 140' : `OPUS ${data.itag}`;
 
-            // Set audio source (Proxy guarantees smooth playback without YouTube CDN 403 blocks)
+            // Direct = browser fetches googlevideo itself (no server bandwidth). Stream URLs are
+            // bound to the server's IP, so this only works when browser and server share an IP;
+            // otherwise the 'error' handler falls back to the proxy automatically.
             lastStreamData = data;
-            audioPlayer.src = `/api/proxy-stream/${videoId}`;
+            usingDirect = streamMode === 'direct' && !!data.url;
+            audioPlayer.src = usingDirect ? data.url : `/api/proxy-stream/${videoId}`;
             audioPlayer.volume = volumeSlider.value / 100;
 
             playerBar.classList.remove('hidden');
@@ -235,7 +239,7 @@
             // Update document title
             document.title = `${data.title} — YT Stream Player`;
 
-            showToast(`Đang phát: ${data.title}`, 'success');
+            showToast(`Đang phát${usingDirect ? ' (Direct)' : ''}: ${data.title}`, 'success');
         } catch (error) {
             console.error('Play error:', error);
             showToast('Lỗi phát nhạc: ' + error.message);
@@ -348,7 +352,7 @@
         modeDirect.classList.toggle('active', mode === 'direct');
 
         if (mode === 'direct') {
-            showToast('YouTube CDN chặn direct browser; hệ thống tự động qua Proxy.', 'info');
+            showToast('Direct: phát thẳng từ YouTube CDN. Nếu CDN chặn sẽ tự chuyển sang Proxy.', 'info');
         } else {
             showToast('Đang sử dụng Proxy Stream tối ưu', 'success');
         }
@@ -393,6 +397,19 @@
         const err = audioPlayer.error;
         const errMsg = err ? `Code ${err.code}: ${err.message || 'Unknown'}` : 'Unknown error';
         console.error('Audio error:', errMsg);
+
+        // Direct failed (usually CDN 403: URL is bound to the server IP) -> switch to proxy, keep position
+        if (usingDirect && lastStreamData?.videoId) {
+            usingDirect = false;
+            const resumeAt = audioPlayer.currentTime || 0;
+            showToast('YouTube CDN chặn phát Direct (link gắn với IP server) — chuyển sang Proxy.', 'info');
+            audioPlayer.src = `/api/proxy-stream/${lastStreamData.videoId}`;
+            audioPlayer.addEventListener('loadedmetadata', () => {
+                if (resumeAt > 0) audioPlayer.currentTime = resumeAt;
+            }, { once: true });
+            audioPlayer.play().then(() => setPlayState(true)).catch(() => {});
+            return;
+        }
         
         // Auto-retry once (proxy-stream may have timed out)
         if (retryCount < 1 && currentIndex >= 0 && playlist[currentIndex]) {

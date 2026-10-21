@@ -1,12 +1,14 @@
 import express from 'express';
 import path from 'path';
 import dns from 'dns';
+import fs from 'fs';
 import net from 'net';
 import { fileURLToPath } from 'url';
-import { Innertube, Platform } from 'youtubei.js';
+import { Innertube, Platform, Parser, ProtoUtils } from 'youtubei.js';
 import { JSDOM } from 'jsdom';
 import { BotGuardClient, getChallenge } from 'bgutils-js/botguard';
 import { buildURL, getHeaders, base64ToU8, u8ToBase64 } from 'bgutils-js/utils';
+import { ProxyAgent, fetch as undiciFetch } from 'undici';
 
 // Auto-detect IPv6 connectivity or default to ipv4first
 async function detectAndSetDnsOrder() {
@@ -21,10 +23,71 @@ dns.setDefaultResultOrder('ipv4first');
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Node does NOT read .env automatically — load it here, before any process.env reads.
+// Existing environment variables (e.g. set by the hosting panel) are not overridden.
+function loadDotEnv(file) {
+    if (!fs.existsSync(file)) {
+        console.log(`[Env] No .env found at ${file}`);
+        return;
+    }
+    try {
+        if (typeof process.loadEnvFile === 'function') {
+            process.loadEnvFile(file); // Node >= 20.12
+        } else {
+            for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+                const m = line.match(/^\s*(?:export\s+)?([\w.-]+)\s*=\s*(.*)\s*$/);
+                if (!m || line.trim().startsWith('#')) continue;
+                let val = m[2].trim();
+                if (/^(["']).*\1$/.test(val)) val = val.slice(1, -1);
+                if (process.env[m[1]] === undefined) process.env[m[1]] = val;
+            }
+        }
+        console.log(`[Env] Loaded ${file}`);
+    } catch (e) {
+        console.warn(`[Env] Failed to load ${file}:`, e.message);
+    }
+}
+loadDotEnv(path.join(__dirname, '.env'));
+
 // Provide a custom JavaScript interpreter for deciphering streaming URLs
 Platform.shim.eval = async (data, env) => {
     return new Function(data.output)();
 };
+
+// YouTube constantly ships new renderer types (e.g. PlayerErrorCommand). The parser
+// JIT-generates them anyway, so "class not found/changed" warnings are just noise.
+Parser.setParserErrorHandler(({ classname, error_type }) => {
+    if (error_type === 'class_not_found' || error_type === 'class_changed') return;
+    console.warn(`[YTJS Parser] ${error_type} at ${classname}`);
+});
+
+// Optional: Netscape-format cookie string of a (throwaway) logged-in account.
+// This is the most reliable fix when the host IP gets "Sign in to confirm you're not a bot".
+const YT_COOKIE = process.env.YT_COOKIE || undefined;
+
+// Optional: route ALL YouTube traffic through a proxy, e.g. http://user:pass@host:port
+// Stream URLs are bound to the requesting IP (`ip=` param), so CDN downloads must use
+// the same proxy as the player requests — hence one shared ytFetch for everything.
+const YT_PROXY = process.env.YT_PROXY || undefined;
+const proxyAgent = YT_PROXY ? new ProxyAgent(YT_PROXY) : null;
+
+async function ytFetch(input, init = {}) {
+    if (!proxyAgent) return fetch(input, init);
+    // youtubei.js passes Node's global Request objects; undici's own fetch needs plain values
+    if (input instanceof Request) {
+        const hasBody = !['GET', 'HEAD'].includes(input.method);
+        init = {
+            method: input.method,
+            headers: Object.fromEntries(input.headers),
+            body: hasBody ? await input.arrayBuffer() : undefined,
+            redirect: input.redirect,
+            ...init,
+        };
+        input = input.url;
+    }
+    if (init.headers instanceof Headers) init.headers = Object.fromEntries(init.headers);
+    return undiciFetch(input, { ...init, dispatcher: proxyAgent });
+}
 
 // In-memory cache
 class NodeCache {
@@ -34,14 +97,19 @@ class NodeCache {
     async remove(key) { this.cache.delete(key); }
 }
 
+// Shared cache so the player JS is downloaded once, not once per video
+const sharedCache = new NodeCache();
+
 const app = express();
-const port = 3210;
+const port = process.env.PORT || 3210;
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Client fallback order — YTMUSIC and ANDROID_VR provide reliable streams
-const CLIENT_FALLBACKS = ['YTMUSIC', 'ANDROID_VR', 'TV', 'ANDROID', 'WEB'];
+// Client fallback order — YTMUSIC is most reliable; ANDROID_VR works with a video-bound
+// PoToken. WEB often returns SABR-only formats (no direct URL), so it's near the end.
+const CLIENT_FALLBACKS = ['YTMUSIC', 'ANDROID_VR', 'TV', 'WEB', 'ANDROID'];
+const AUDIO_ITAGS = [251, 140, 250, 249];
 
 // Headers required by YouTube CDN
 const CDN_FETCH_HEADERS = {
@@ -66,6 +134,7 @@ class PoTokenManager {
         console.log('[PoToken] Initializing BotGuard challenge & minter...');
         const bareYt = await Innertube.create({
             cache: new NodeCache(),
+            fetch: ytFetch,
             retrieve_player: false,
             generate_session_locally: false,
         });
@@ -76,7 +145,7 @@ class PoTokenManager {
         const requestKey = 'O43z0dpjhgX20SCx4KAo';
         const challenge = await getChallenge({
             requestKey,
-            fetchFunction: fetch,
+            fetchFunction: ytFetch,
         });
         if (!challenge) throw new Error('Could not create BotGuard challenge');
 
@@ -102,7 +171,7 @@ class PoTokenManager {
             const botguardResponse = await bgClient.snapshot({ webPoSignalOutput });
 
             const payload = [requestKey, botguardResponse];
-            const integrityTokenResponse = await fetch(buildURL('GenerateIT'), {
+            const integrityTokenResponse = await ytFetch(buildURL('GenerateIT'), {
                 method: 'POST',
                 headers: getHeaders(),
                 body: JSON.stringify(payload)
@@ -157,14 +226,103 @@ const poTokenManager = new PoTokenManager();
 
 let singletonInnertube = null;
 
+// Visitor ID must match the cookie's VISITOR_INFO1_LIVE, otherwise YouTube sees
+// "account A + random visitor B" in one request, which looks like a bot.
+function getCookieValue(cookie, name) {
+    const m = cookie?.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
+    return m ? m[1] : null;
+}
+const COOKIE_VISITOR_ID = getCookieValue(YT_COOKIE, 'VISITOR_INFO1_LIVE');
+const cookieSessionOpts = () => (YT_COOKIE ? {
+    cookie: YT_COOKIE,
+    ...(COOKIE_VISITOR_ID ? { visitor_data: ProtoUtils.encodeVisitorData(COOKIE_VISITOR_ID, Math.floor(Date.now() / 1000)) } : {}),
+} : {});
+
+// Clients that accept cookies (ANDROID / ANDROID_VR ignore them).
+// YTMUSIC first: TV currently returns "UNPLAYABLE (The page needs to be reloaded.)".
+const COOKIE_CLIENTS = ['YTMUSIC', 'TV', 'WEB'];
+
 async function getInnertube() {
     if (!singletonInnertube) {
         singletonInnertube = await Innertube.create({
-            cache: new NodeCache(),
+            cache: sharedCache,
+            fetch: ytFetch,
             generate_session_locally: true,
+            ...cookieSessionOpts(),
         });
     }
     return singletonInnertube;
+}
+
+// Builds the ordered list of (session, client) attempts:
+// 1) logged-in cookie session on cookie-capable clients (if YT_COOKIE set)
+// 2) anonymous session using the BotGuard visitor + video-bound PoToken (NO cookie)
+async function buildAttempts(poData) {
+    const attempts = [];
+    if (YT_COOKIE) {
+        const ytCookie = await Innertube.create({
+            cache: sharedCache,
+            fetch: ytFetch,
+            generate_session_locally: true,
+            ...cookieSessionOpts(),
+            ...(poData ? { po_token: poData.poToken } : {}),
+        });
+        for (const client of COOKIE_CLIENTS) attempts.push({ yt: ytCookie, client, label: `${client}+cookie` });
+    }
+    // po_token here is also appended to stream URLs as `pot` by the Player
+    const ytAnon = await Innertube.create({
+        cache: sharedCache,
+        fetch: ytFetch,
+        generate_session_locally: true,
+        ...(poData ? { po_token: poData.poToken, visitor_data: poData.visitorData } : {}),
+    });
+    for (const client of CLIENT_FALLBACKS) attempts.push({ yt: ytAnon, client, label: client });
+    return attempts;
+}
+
+// Verifies the cookie really logs in (expired/rotated cookies silently act as logged-out)
+async function checkCookieLogin() {
+    if (!YT_COOKIE) return;
+    const missing = ['SAPISID', 'SID', '__Secure-3PSID'].filter(k => !getCookieValue(YT_COOKIE, k));
+    if (missing.length) console.warn(`[Cookie] Missing keys: ${missing.join(', ')}`);
+    try {
+        const yt = await getInnertube();
+        const resp = await yt.actions.execute('/account/account_menu', { client: 'WEB' });
+        const raw = JSON.stringify(resp.data);
+        const name = raw.match(/"accountName":\{(?:"simpleText":"([^"]+)"|"runs":\[\{"text":"([^"]+)")/);
+        if (name) console.log(`[Cookie] Logged in as: ${name[1] || name[2]}`);
+        else console.warn('[Cookie] NOT logged in — cookie is invalid, expired or was rotated by Google. Export a fresh one.');
+    } catch (e) {
+        console.warn('[Cookie] Login check failed:', e.message);
+    }
+}
+
+function isBotCheck(reason = '') {
+    return /not a bot|sign in to confirm/i.test(reason);
+}
+
+// Fetch player info ONCE for a client, then pick the best audio itag locally.
+// (yt.getStreamingData() re-requests /player for every itag, multiplying traffic.)
+async function tryClient(yt, videoId, client, poToken) {
+    const info = await yt.getBasicInfo(videoId, { client, po_token: poToken });
+    const ps = info.playability_status;
+    if (ps?.status && ps.status !== 'OK') {
+        return { error: `${ps.status}${ps.reason ? ` (${ps.reason})` : ''}`, botCheck: isBotCheck(ps.reason) };
+    }
+    if (!info.streaming_data) return { error: 'no streaming_data' };
+
+    for (const itag of AUDIO_ITAGS) {
+        let format;
+        try { format = info.chooseFormat({ itag, type: 'audio' }); } catch { continue; }
+        const url = await format.decipher(yt.session.player);
+        if (url) return { url, itag: format.itag };
+    }
+    try {
+        const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+        const url = await format.decipher(yt.session.player);
+        if (url) return { url, itag: format.itag };
+    } catch { }
+    return { error: 'no audio formats' };
 }
 
 // ============ Metadata Cache ============
@@ -223,26 +381,29 @@ async function resolveStreamUrl(videoId) {
     const promise = (async () => {
         const t0 = Date.now();
         const poData = await poTokenManager.getPoTokenForVideo(videoId);
+        const attempts = await buildAttempts(poData);
 
-        const ytOpts = poData
-            ? { po_token: poData.poToken, visitor_data: poData.visitorData, cache: new NodeCache(), generate_session_locally: true }
-            : { cache: new NodeCache(), generate_session_locally: true };
-
-        const yt = await Innertube.create(ytOpts);
-
-        for (const client of CLIENT_FALLBACKS) {
-            for (const itag of [251, 140, 250, 249]) {
-                try {
-                    const streamData = await yt.getStreamingData(videoId, { itag, client });
-                    if (streamData?.url) {
-                        const entry = { url: streamData.url, client, itag: streamData.itag, timestamp: Date.now() };
-                        streamUrlCache.set(videoId, entry);
-                        console.log(`[URL] ${videoId} -> ${client} (itag: ${streamData.itag}) OK (${Date.now() - t0}ms)`);
-                        return entry;
-                    }
-                } catch (_) {}
+        let botChecks = 0;
+        for (const { yt, client, label } of attempts) {
+            try {
+                const r = await tryClient(yt, videoId, client, poData?.poToken);
+                if (r.url) {
+                    const entry = { url: r.url, client: label, itag: r.itag, timestamp: Date.now() };
+                    streamUrlCache.set(videoId, entry);
+                    console.log(`[URL] ${videoId} -> ${label} (itag: ${r.itag}) OK (${Date.now() - t0}ms)`);
+                    return entry;
+                }
+                if (r.botCheck) botChecks++;
+                console.log(`[URL] ${videoId} -> ${label}: ${r.error}`);
+            } catch (e) {
+                console.log(`[URL] ${videoId} -> ${label}: ${e.message}`);
             }
-            console.log(`[URL] ${videoId} -> ${client}: no URL`);
+        }
+        if (botChecks > 0) {
+            const hint = YT_COOKIE
+                ? 'Cookie did not help — check the [Cookie] startup log, or use a residential proxy (YT_PROXY).'
+                : 'Set YT_COOKIE or use a residential proxy (YT_PROXY).';
+            throw new Error(`YouTube bot check on ${botChecks}/${attempts.length} attempts — this server IP is flagged. ${hint}`);
         }
         throw new Error('No stream URLs available from any client');
     })();
@@ -372,7 +533,7 @@ app.get('/api/proxy-stream/:videoId', async (req, res) => {
         const CHUNK_SIZE = 512 * 1024;
         const firstChunkEnd = endByte !== null ? Math.min(startByte + CHUNK_SIZE - 1, endByte) : startByte + CHUNK_SIZE - 1;
 
-        let firstChunkResp = await fetch(streamEntry.url, {
+        let firstChunkResp = await ytFetch(streamEntry.url, {
             headers: {
                 ...CDN_FETCH_HEADERS,
                 'Range': `bytes=${startByte}-${firstChunkEnd}`,
@@ -384,7 +545,7 @@ app.get('/api/proxy-stream/:videoId', async (req, res) => {
             console.log(`[Proxy] ${videoId} fetch returned ${firstChunkResp.status}, refreshing stream URL...`);
             streamUrlCache.delete(videoId);
             streamEntry = await resolveStreamUrl(videoId);
-            firstChunkResp = await fetch(streamEntry.url, {
+            firstChunkResp = await ytFetch(streamEntry.url, {
                 headers: {
                     ...CDN_FETCH_HEADERS,
                     'Range': `bytes=${startByte}-${firstChunkEnd}`,
@@ -441,7 +602,7 @@ app.get('/api/proxy-stream/:videoId', async (req, res) => {
 
         while (currentPos <= targetEnd && !isClosed) {
             const chunkEnd = Math.min(currentPos + CHUNK_SIZE - 1, targetEnd);
-            const chunkResp = await fetch(streamEntry.url, {
+            const chunkResp = await ytFetch(streamEntry.url, {
                 headers: {
                     ...CDN_FETCH_HEADERS,
                     'Range': `bytes=${currentPos}-${chunkEnd}`,
@@ -484,6 +645,8 @@ app.get('/api/stats', (req, res) => {
         metaCache: META_CACHE.size,
         pendingResolves: pendingResolves.size,
         poTokenActive: !!poTokenManager.minterData,
+        cookie: !!YT_COOKIE,
+        proxy: !!YT_PROXY,
         innertubeReady: !!singletonInnertube,
     });
 });
@@ -495,24 +658,22 @@ app.get('/api/debug-stream/:videoId', async (req, res) => {
 
     try {
         const poData = await poTokenManager.getPoTokenForVideo(videoId);
-        const ytOpts = poData
-            ? { po_token: poData.poToken, visitor_data: poData.visitorData, cache: new NodeCache(), generate_session_locally: true }
-            : { cache: new NodeCache(), generate_session_locally: true };
-        const yt = await Innertube.create(ytOpts);
+        const attempts = await buildAttempts(poData);
 
-        for (const client of CLIENT_FALLBACKS) {
-            const entry = { client, status: null, error: null, urlLen: 0 };
+        for (const { yt, client, label } of attempts) {
+            const entry = { client: label, status: null, error: null, urlLen: 0 };
             try {
-                const streamData = await yt.getStreamingData(videoId, { itag: 140, client });
-                if (!streamData?.url) {
-                    entry.error = 'No URL returned';
+                const r = await tryClient(yt, videoId, client, poData?.poToken);
+                if (!r.url) {
+                    entry.error = r.error;
                     results.push(entry);
                     continue;
                 }
-                entry.urlLen = streamData.url.length;
-                entry.urlHost = new URL(streamData.url).hostname;
+                entry.itag = r.itag;
+                entry.urlLen = r.url.length;
+                entry.urlHost = new URL(r.url).hostname;
 
-                const resp = await fetch(streamData.url, {
+                const resp = await ytFetch(r.url, {
                     headers: { ...CDN_FETCH_HEADERS, 'Range': 'bytes=0-1023' }
                 });
                 entry.status = resp.status;
@@ -533,7 +694,7 @@ app.get('/api/debug-stream/:videoId', async (req, res) => {
             results.push(entry);
         }
 
-        res.json({ videoId, poToken: !!poData, results });
+        res.json({ videoId, poToken: !!poData, cookie: !!YT_COOKIE, results });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -547,12 +708,13 @@ app.get('/', (req, res) => {
 // Startup: initialize DNS order, Innertube, then listen
 (async () => {
     const dnsOrder = await detectAndSetDnsOrder();
-    
+
     app.listen(port, () => {
         console.log(`\n🎵 YT Stream Player running at http://localhost:${port}`);
         console.log(`   DNS order: ${dnsOrder}`);
         console.log(`   Platform: ${process.platform} ${process.arch}`);
-        console.log(`   Node.js: ${process.version}\n`);
+        console.log(`   Node.js: ${process.version}`);
+        console.log(`   YT_COOKIE: ${YT_COOKIE ? 'set' : 'not set'} | YT_PROXY: ${YT_PROXY ? YT_PROXY.replace(/\/\/[^@]*@/, '//***@') : 'not set'}\n`);
     });
 
     // Pre-warm Innertube + BotGuard Minter in background
@@ -561,6 +723,7 @@ app.get('/', (req, res) => {
         poTokenManager.getMinter(),
     ]).then(() => {
         console.log('[Startup] Innertube & BotGuard Minter pre-warmed successfully');
+        return checkCookieLogin();
     }).catch(e => {
         console.error('[Startup] Pre-warm error:', e.message);
     });
